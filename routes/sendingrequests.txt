@@ -1,0 +1,39 @@
+const formattedContributors = (contributors || []).map((id) => ({
+        authorId: id,
+      }))
+
+      console.log('Formatted contributors:', formattedContributors)
+
+      if (contributors && contributors.length > 0) {
+        console.log('Creating Collaboration Requests...')
+
+        const newCollabRequest = new collaborationsRequestSchema({
+          materialId: savedMaterial._id,
+          requestedBy: userId,
+          requestedTo: formattedContributors.map((contributor) => ({
+            authorId: contributor.authorId,
+            authorAction: 'pending',
+          })),
+          dateRequested: Date.now(),
+        })
+        const savedRequest = await newCollabRequest.save()
+
+        const pendingRequests = contributors.map((contributorId) => ({
+          collabRequest_ID: savedRequest._id,
+          requestedTo: contributorId,
+          userAction: 'pending',
+        }))
+        await pendingCollabRequest.insertMany(pendingRequests)
+
+        return res.status(201).json({
+          message:
+            'Material added successfully, and collaboration requests sent!',
+          material: savedMaterial,
+          collabRequest: savedRequest,
+          pendingRequests,
+        })
+      }
+      res.status(201).json({
+        message: 'Material added successfully!',
+        material: savedMaterial,
+      })

@@ -1,0 +1,518 @@
+old api:
+const express = require('express')
+const router = express.Router()
+const mongoose = require('mongoose')
+
+const Materials = require('../src/schemas/schemaMaterials')
+const ReadingList = require('../src/schemas/schemaReadingLists')
+const Rating = require('../src/schemas/schemaMaterialRatings')
+const Comment = require('../src/schemas/schemaMaterialComments')
+const Profile = require('../src/schemas/schemaUserProfile')
+const { ObjectId } = require('bson')
+
+const generateAggregationPipeline = (dateField, timeUnit, userId) => {
+  let dateFormat
+
+  switch (timeUnit) {
+    case 'weekly':
+      dateFormat = {
+        year: { $year: `$${dateField}` },
+        month: { $month: `$${dateField}` },
+        week: {
+          $ceil: { $divide: [{ $dayOfMonth: `$${dateField}` }, 7] }, // Calculate week 1-4
+        },
+      }
+      break
+    case 'monthly':
+      dateFormat = { $dateToString: { format: '%Y-%m', date: `$${dateField}` } }
+      break
+    case 'yearly':
+      dateFormat = { $dateToString: { format: '%Y', date: `$${dateField}` } }
+      break
+    default:
+      throw new Error('Invalid time unit')
+  }
+
+  return [
+    {
+      $lookup: {
+        from: 'tblmaterials',
+        localField: 'materialId',
+        foreignField: '_id',
+        as: 'material',
+      },
+    },
+    { $unwind: '$material' },
+    {
+      $match: {
+        'material.primaryAuthor': userId,
+      },
+    },
+    {
+      $group: {
+        _id:
+          timeUnit === 'weekly'
+            ? {
+                year: dateFormat.year,
+                month: dateFormat.month,
+                week: dateFormat.week,
+              }
+            : {
+                timePeriod: dateFormat,
+              },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { '_id.year': 1, '_id.month': 1, '_id.week': 1 } },
+  ]
+}
+
+const generateAggregationPipelines = (dateField, timeUnit, userId) => {
+  let dateFormat
+
+  switch (timeUnit) {
+    case 'daily': // <-- Add daily support
+      dateFormat = {
+        $dateToString: { format: '%Y-%m-%d', date: `$${dateField}` },
+      }
+      break
+    case 'weekly':
+      dateFormat = {
+        year: { $year: `$${dateField}` },
+        month: { $month: `$${dateField}` },
+        week: { $ceil: { $divide: [{ $dayOfMonth: `$${dateField}` }, 7] } },
+      }
+      break
+    case 'monthly':
+      dateFormat = { $dateToString: { format: '%Y-%m', date: `$${dateField}` } }
+      break
+    case 'yearly':
+      dateFormat = { $dateToString: { format: '%Y', date: `$${dateField}` } }
+      break
+    default:
+      throw new Error('Invalid time unit')
+  }
+
+  return [
+    {
+      $lookup: {
+        from: 'tblmaterials',
+        localField: 'materialId',
+        foreignField: '_id',
+        as: 'material',
+      },
+    },
+    { $unwind: '$material' },
+    {
+      $match: {
+        'material.primaryAuthor': userId,
+      },
+    },
+    {
+      $group: {
+        _id:
+          timeUnit === 'weekly'
+            ? {
+                year: dateFormat.year,
+                month: dateFormat.month,
+                week: dateFormat.week,
+              }
+            : {
+                timePeriod: dateFormat,
+              },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { '_id.year': 1, '_id.month': 1, '_id.week': 1 } },
+  ]
+}
+
+router.get('/materialAnalytics/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  try {
+    const materials = await Materials.find({ primaryAuthor: userId })
+
+    const totalReads = materials.reduce(
+      (sum, material) => sum + (material.totalReads || 0),
+      0
+    )
+    const totalComments = materials.reduce(
+      (sum, material) => sum + (material.totalComments || 0),
+      0
+    )
+    const totalMaterials = materials.length
+
+    res.json({
+      totalReads,
+      totalComments,
+      totalMaterials,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ message: 'Internal server error' })
+  }
+})
+
+router.get('/materialTypeMetrics/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  try {
+    const materialTypeCounts = await Materials.aggregate([
+      { $match: { primaryAuthor: userId } },
+      {
+        $group: {
+          _id: '$materialType',
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { count: -1 } },
+    ])
+
+    res.json(materialTypeCounts)
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ message: 'Internal server error' })
+  }
+})
+
+router.get('/totalReadsPerMaterial/:userId', async (req, res) => {
+  const { userId } = req.params
+
+  try {
+    const materialTypeCounts = await Materials.aggregate([
+      { $match: { primaryAuthor: userId } },
+      {
+        $group: {
+          _id: '$materialType',
+          totalReads: { $sum: '$totalReads' },
+        },
+      },
+      { $sort: { totalReads: -1 } },
+    ])
+
+    res.json(materialTypeCounts)
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ message: 'Internal server error' })
+  }
+})
+
+router.get('/materialHistory/:userId/:timeUnit', async (req, res) => {
+  const { userId, timeUnit } = req.params
+  try {
+    const readingListPipeline = generateAggregationPipeline(
+      'dateAccessed',
+      timeUnit,
+      userId
+    )
+    const commentsPipeline = generateAggregationPipeline(
+      'commentDate',
+      timeUnit,
+      userId
+    )
+    const ratingsPipeline = generateAggregationPipeline(
+      'ratedDate',
+      timeUnit,
+      userId
+    )
+
+    const [readingListHistory, commentsHistory, ratingsHistory] =
+      await Promise.all([
+        ReadingList.aggregate(readingListPipeline),
+        Comment.aggregate(commentsPipeline),
+        Rating.aggregate(ratingsPipeline),
+      ])
+
+    res.json({
+      readingListHistory,
+      commentsHistory,
+      ratingsHistory,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ message: 'Internal server error' })
+  }
+})
+
+//user engagement
+
+router.get('/userAnalytics/:userId', async (req, res) => {
+  const { userId } = req.params
+  try {
+    const materials = await Materials.aggregate([
+      {
+        $match: {
+          $or: [{ primaryAuthor: userId }, { contributors: userId }],
+        },
+      },
+      {
+        $project: {
+          authorIds: {
+            $concatArrays: [
+              [
+                {
+                  $cond: [
+                    { $ne: ['$primaryAuthor', userId] },
+                    '$primaryAuthor',
+                    null,
+                  ],
+                },
+              ],
+              {
+                $filter: {
+                  input: '$contributors',
+                  as: 'contributor',
+                  cond: { $ne: ['$$contributor', userId] },
+                },
+              },
+            ],
+          },
+          disciplines: 1,
+        },
+      },
+      { $unwind: '$authorIds' },
+      { $match: { authorIds: { $ne: null } } },
+      {
+        $group: {
+          _id: null,
+          authorIds: { $addToSet: '$authorIds' },
+          totalCollaborations: { $sum: 1 },
+          disciplines: { $addToSet: '$disciplines' },
+        },
+      },
+    ])
+
+    if (!materials.length) {
+      return res.status(200).json({
+        objectIds: [],
+        stringIds: [],
+        institutions: [],
+        totalCollaborations: 0,
+        totalInstitutions: 0,
+        totalDisciplines: 0,
+        disciplines: [],
+      })
+    }
+
+    const authorIds = materials[0].authorIds
+
+    // Separate ObjectIds and string names
+    const objectIds = authorIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id))
+
+    const stringIds = authorIds.filter(
+      (id) => !mongoose.Types.ObjectId.isValid(id)
+    )
+
+    const authorProfiles = await Profile.find({}, 'primaryInstitution userType')
+
+    const normalizedInstitutions = authorProfiles.map((author) => ({
+      primaryInstitution: author.primaryInstitution || 'Not Specified',
+    }))
+    const institutionCounts = normalizedInstitutions.reduce((acc, author) => {
+      const institution = author.primaryInstitution
+      acc[institution] = (acc[institution] || 0) + 1
+      return acc
+    }, {})
+
+    const institutionArray = Object.entries(institutionCounts).map(
+      ([institution, count]) => ({
+        institution,
+        count,
+      })
+    )
+
+    const uniqueDisciplines = [...new Set(materials[0].disciplines.flat())]
+
+    const normalizedType = authorProfiles.map((author) => ({
+      userType: author.userType || 'Not Specified',
+    }))
+    const TypeCounts = normalizedType.reduce((acc, author) => {
+      const type = author.userType
+      acc[type] = (acc[type] || 0) + 1
+      return acc
+    }, {})
+    const typeArray = Object.entries(TypeCounts).map(([type, count]) => ({
+      type,
+      count,
+    }))
+
+    const authorType = await Profile.aggregate([
+      {
+        $match: {
+          userId: { $in: objectIds },
+        },
+      },
+      {
+        $group: {
+          _id: '$userType', // Group by userType
+          count: { $sum: 1 }, // Count the occurrences of each userType
+        },
+      },
+      {
+        $project: {
+          _id: 0, // Exclude _id field
+          userType: {
+            $ifNull: ['$_id', 'Not specified'], // Replace null/undefined _id with "Not specified"
+          },
+          count: 1, // Include count field
+        },
+      },
+    ])
+
+    console.log('User engagement analytics:\n')
+    console.log('Total collaborated authors:', materials[0].totalCollaborations)
+    console.log('Total collaborated institutions:', institutionCounts)
+    console.log('Total disciplines:', uniqueDisciplines.length)
+    console.log('--------------------------------------\n')
+    console.log('Type of collaborators metric:', typeArray)
+    console.log('--------------------------------------\n')
+    console.log('Collaborated institution metric:', institutionArray)
+
+    res.status(200).json({
+      objectIds,
+      stringIds,
+      // institutions: uniqueInstitutions,
+      totalCollaborations: materials[0].totalCollaborations,
+      totalInstitutions: institutionCounts,
+      totalDisciplines: uniqueDisciplines.length,
+      disciplines: uniqueDisciplines,
+      typeArray,
+      institutionArray,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: 'Internal Server Error' })
+  }
+})
+
+router.get('/materialAnalytic/:userId', async (req, res) => {
+  const { userId } = req.params
+  const { type, timeUnit } = req.query // Get the type and timeUnit from query params
+
+  try {
+    if (type === 'overview') {
+      // Fetch material analytics summary
+      const materials = await Materials.find({ primaryAuthor: userId })
+
+      const totalReads = materials.reduce(
+        (sum, material) => sum + (material.totalReads || 0),
+        0
+      )
+      const totalComments = materials.reduce(
+        (sum, material) => sum + (material.totalComments || 0),
+        0
+      )
+      const totalMaterials = materials.length
+
+      return res.json({ totalReads, totalComments, totalMaterials })
+    } else if (type === 'materialType') {
+      // Fetch material type distribution
+      const materialTypeCounts = await Materials.aggregate([
+        { $match: { primaryAuthor: userId } },
+        {
+          $group: {
+            _id: '$materialType',
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { count: -1 } },
+      ])
+
+      return res.json(materialTypeCounts)
+    } else if (type === 'readsPerMaterial') {
+      // Fetch total reads per material type
+      const materialReads = await Materials.aggregate([
+        { $match: { primaryAuthor: userId } },
+        {
+          $group: {
+            _id: '$materialType',
+            totalReads: { $sum: '$totalReads' },
+          },
+        },
+        { $sort: { totalReads: -1 } },
+      ])
+
+      return res.json(materialReads)
+    } else if (type === 'history' && timeUnit) {
+      // Fetch material interaction history (reads, comments, ratings)
+      const readingListPipeline = generateAggregationPipelines(
+        'dateAccessed',
+        timeUnit,
+        userId
+      )
+      const commentsPipeline = generateAggregationPipelines(
+        'commentDate',
+        timeUnit,
+        userId
+      )
+      const ratingsPipeline = generateAggregationPipelines(
+        'ratedDate',
+        timeUnit,
+        userId
+      )
+
+      const [readingListHistory, commentsHistory, ratingsHistory] =
+        await Promise.all([
+          ReadingList.aggregate(readingListPipeline),
+          Comment.aggregate(commentsPipeline),
+          Rating.aggregate(ratingsPipeline),
+        ])
+
+      return res.json({ readingListHistory, commentsHistory, ratingsHistory })
+    } else {
+      return res.status(400).json({ message: 'Invalid request type' })
+    }
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ message: 'Internal server error' })
+  }
+})
+
+module.exports = router
+
+
+useEffect(() => {
+    const fetchMaterialData = async () => {
+      try {
+        setLoading(true)
+        const response_analytics = await axios.get(
+          `http://${SERVER}/apiEngagements/materialAnalytics/${session}`
+        )
+        const response_metrics = await axios.get(
+          `http://${SERVER}/apiEngagements/materialTypeMetrics/${session}`
+        )
+        const response_reads = await axios.get(
+          `http://${SERVER}/apiEngagements/totalReadsPerMaterial/${session}`
+        )
+        const response_history = await axios.get(
+          `http://${SERVER}/apiEngagements/materialHistory/${session}/${filter}`
+        )
+
+        //const analyticsArray = Object.values(response.data)
+        setMaterialAnalytics(response_analytics.data)
+        setTypeMetrics(response_metrics.data)
+
+        const readsData = response_reads.data
+        const xData = readsData.map((item) => item._id)
+        const yData = readsData.map((item) => item.totalReads)
+        setXAxisData(xData)
+        setSeriesData([{ data: yData }])
+
+        const data = response_history.data
+
+        console.log('Reading List History:', data?.readingListHistory || [])
+        console.log('Comments History:', data?.commentsHistory || [])
+        console.log('Ratings History:', data?.ratingsHistory || [])
+
+        setChartData(formatChartData(data, filter))
+      } catch (error) {
+        console.error('Error fetching material analytics:', error)
+      } finally {
+        setLoading(false)
+      }
+    }
+    fetchMaterialData()
+  }, [SERVER, session, filter])
